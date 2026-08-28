@@ -1,0 +1,1425 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import json
+import time
+import random
+import socket
+import socketserver
+import subprocess
+import threading
+import fcntl
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+CONFIG_DIR = os.path.expanduser("~/.config/pyroplayer")
+
+HISTORY_FILE = os.path.join(CONFIG_DIR, "history")
+QUEUE_FILE = os.path.join(CONFIG_DIR, "queue")
+STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
+SOCKET_FILE = os.path.join(CONFIG_DIR, "pyroplayer.sock")
+LOCK_FILE = os.path.join(CONFIG_DIR, "pyroplayer.lock")
+LOG_FILE = os.path.join(CONFIG_DIR, "pyroplayer.log")
+
+os.makedirs(CONFIG_DIR, exist_ok=True)
+
+for path in (HISTORY_FILE, QUEUE_FILE):
+    open(path, "a").close()
+
+
+# ============================================================
+# GLOBAL STATE
+# ============================================================
+
+running = True
+active = False
+
+# ------------------------------------------------------------
+# Playback tracking
+# ------------------------------------------------------------
+
+# Song PyroPlayer intentionally asked MPD to play.
+expected_song = ""
+
+# True while PyroPlayer itself is changing MPD.
+commanded_change = False
+
+# Last song successfully registered in history.
+last_played_song = ""
+
+state_lock = threading.RLock()
+mpc_lock = threading.RLock()
+
+server = None
+lock_fd = None
+
+# ============================================================
+# FILE HELPERS
+# ============================================================
+
+def read_lines(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return [line.rstrip("\n") for line in f]
+    except FileNotFoundError:
+        return []
+
+
+def write_lines(path, lines):
+    tmp = path + ".tmp"
+
+    with open(tmp, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")
+
+    os.replace(tmp, path)
+
+
+def history():
+    return read_lines(HISTORY_FILE)
+
+
+def queue():
+    return read_lines(QUEUE_FILE)
+
+
+def save_state(index):
+    data = {
+        "current_index": index
+    }
+
+    tmp = STATE_FILE + ".tmp"
+
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    os.replace(tmp, STATE_FILE)
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"current_index": -1}
+
+
+# ============================================================
+# MPD HELPERS
+# ============================================================
+
+def mpc(*args):
+    # `mpc idle` intentionally blocks until MPD reports
+    # an event. It must NOT hold mpc_lock while waiting.
+    if args and args[0] == "idle":
+        result = subprocess.run(
+            ["mpc", *args],
+            capture_output=True,
+            text=True
+        )
+    else:
+        with mpc_lock:
+            result = subprocess.run(
+                ["mpc", *args],
+                capture_output=True,
+                text=True
+            )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.strip() or result.stdout.strip()
+        )
+
+    return result.stdout.strip()
+
+def all_songs():
+    output = mpc("listall")
+
+    if not output:
+        return []
+
+    return [
+        line
+        for line in output.splitlines()
+        if line.strip()
+    ]
+
+
+def current_song():
+    try:
+        return mpc("current")
+    except Exception:
+        return ""
+
+def current_song_file():
+    try:
+        output = mpc("current", "-f", "%file%")
+        return output.strip()
+    except Exception:
+        return ""
+
+def mpd_status():
+    try:
+        return mpc("status")
+    except Exception:
+        return ""
+
+
+def mpd_state():
+    status = mpd_status()
+
+    for line in status.splitlines():
+        if line.startswith("[playing]"):
+            return "playing"
+
+        if line.startswith("[paused]"):
+            return "paused"
+
+    return "stopped"
+
+
+# ============================================================
+# HISTORY / QUEUE
+# ============================================================
+
+def mark_played(song):
+
+    global last_played_song
+
+    if not song:
+        return
+
+    with state_lock:
+
+        h = history()
+
+        # Never record the same song twice.
+        if song in h:
+            last_played_song = song
+            save_state(h.index(song))
+            return
+
+        h.append(song)
+
+        write_lines(
+            HISTORY_FILE,
+            h
+        )
+
+        last_played_song = song
+
+        save_state(
+            len(h) - 1
+        )
+
+def available_songs():
+    songs = all_songs()
+
+    played = set(history())
+    queued = set(queue())
+
+    return [
+        song
+        for song in songs
+        if song not in played
+        and song not in queued
+    ]
+
+
+# ============================================================
+# PLAYBACK
+# ============================================================
+
+def play_song(song):
+    global active
+    global expected_song
+    global commanded_change
+
+    with state_lock:
+
+        # Tell the event watcher that this MPD change
+        # was intentionally requested by PyroPlayer.
+        commanded_change = True
+        expected_song = song
+
+        try:
+            mpc("clear")
+            mpc("add", song)
+            mpc("play")
+
+            active = True
+
+        except Exception:
+            expected_song = ""
+            commanded_change = False
+            raise
+
+    # Give MPD a moment to switch to the requested song.
+    #
+    # We do NOT record history merely because we selected
+    # the song. We verify that MPD actually started it.
+    for _ in range(20):
+
+        time.sleep(0.05)
+
+        actual = current_song_file()
+
+        if actual == song:
+            mark_played(song)
+
+            commanded_change = False
+
+            return f"▶ {song}"
+
+    # MPD never reported the requested song.
+    commanded_change = False
+
+    return (
+        f"ERROR: MPD did not start requested song:\n"
+        f"Expected: {song}\n"
+        f"Actual:   {current_song_file()}"
+    )
+
+def replay_history_song(song):
+    global active
+    global expected_song
+    global commanded_change
+
+    with state_lock:
+
+        if song not in history():
+            return "ERROR: Song is not in history."
+
+        commanded_change = True
+        expected_song = song
+
+        try:
+            mpc("clear")
+            mpc("add", song)
+            mpc("play")
+
+            active = True
+
+        except Exception:
+            expected_song = ""
+            commanded_change = False
+            raise
+
+    # Verify that MPD actually started the requested file.
+    for _ in range(20):
+
+        time.sleep(0.05)
+
+        actual = current_song_file()
+
+        if actual == song:
+            commanded_change = False
+
+            return f"↻ {song}"
+
+    commanded_change = False
+
+    return (
+        f"ERROR: MPD did not start requested song:\n"
+        f"Expected: {song}\n"
+        f"Actual:   {current_song_file()}"
+    )
+
+def choose_random():
+    candidates = available_songs()
+
+    if not candidates:
+        return None
+
+    return random.choice(candidates)
+
+
+def reset_cycle():
+    with state_lock:
+        write_lines(HISTORY_FILE, [])
+        write_lines(QUEUE_FILE, [])
+        save_state(-1)
+
+
+def play_random():
+    song = choose_random()
+
+    if song is None:
+        reset_cycle()
+        song = choose_random()
+
+    if song is None:
+        return "No songs available."
+
+    return play_song(song)
+
+
+def play_next():
+
+    with state_lock:
+        q = queue()
+
+        if q:
+            song = q.pop(0)
+            write_lines(QUEUE_FILE, q)
+
+        else:
+            song = None
+
+    if song:
+        return play_song(song)
+
+    return play_random()
+
+# ============================================================
+# QUEUE
+# ============================================================
+
+def add_to_queue(song):
+    with state_lock:
+
+        if song in history():
+            return "ERROR: Song has already been played."
+
+        q = queue()
+
+        if song in q:
+            return "ERROR: Song is already queued."
+
+        if song not in all_songs():
+            return "ERROR: Song not found in MPD database."
+
+        q.append(song)
+        write_lines(QUEUE_FILE, q)
+
+    return f"⏭ Queued: {song}"
+
+
+# ============================================================
+# PREVIOUS
+# ============================================================
+
+def previous_song():
+
+    global active
+    global expected_song
+    global commanded_change
+
+    with state_lock:
+
+        h = history()
+        state = load_state()
+
+        index = state.get("current_index", -1)
+
+        if index <= 0 or not h:
+            return "No previous song."
+
+        index -= 1
+        song = h[index]
+
+        commanded_change = True
+        expected_song = song
+
+        try:
+            mpc("clear")
+            mpc("add", song)
+            mpc("play")
+
+            active = True
+            save_state(index)
+
+        except Exception:
+            expected_song = ""
+            commanded_change = False
+            raise
+
+    for _ in range(20):
+
+        time.sleep(0.05)
+
+        if current_song() == song:
+            commanded_change = False
+            return f"◀ {song}"
+
+    commanded_change = False
+
+    return (
+        f"ERROR: MPD did not start requested song:\n"
+        f"Expected: {song}\n"
+        f"Actual:   {current_song()}"
+    )
+
+# ============================================================
+# STATUS
+# ============================================================
+
+def status():
+    song = current_song()
+    state = mpd_state()
+
+    h = history()
+    q = queue()
+
+    return {
+        "song": song,
+        "state": state,
+        "played": len(h),
+        "total": len(all_songs()),
+        "queue": q,
+        "active": active
+    }
+
+
+# ============================================================
+# DAEMON COMMAND HANDLER
+# ============================================================
+
+def handle_command(command, argument=None):
+
+    global active
+    global running
+    global server
+
+    if command == "ping":
+        return "OK"
+
+    if command == "status":
+        return status()
+
+    if command == "play":
+        if not argument:
+            return "ERROR: No song specified."
+
+        try:
+            return play_song(argument)
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    if command == "start_random":
+        try:
+            if active and mpd_state() in ("playing", "paused"):
+                return "ALREADY_RUNNING"
+
+            return play_random()
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    if command == "next_random":
+        try:
+            return play_random()
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    if command == "available":
+        return "\n".join(available_songs())
+
+    if command == "reset":
+        reset_cycle()
+        return "OK"
+
+    if command == "queue_add":
+        return add_to_queue(argument)
+
+    if command == "queue":
+        return "\n".join(
+            f"{i + 1:3}  {song}"
+            for i, song in enumerate(queue())
+        ) or "Queue is empty."
+
+    if command == "history":
+        h = history()
+
+        if not h:
+            return "No songs have been played yet."
+
+        return "\n".join(
+            f"{i + 1:3}  {song}"
+            for i, song in enumerate(h)
+        )
+
+    if command == "history_play":
+
+        if not argument:
+            return "ERROR: No history song specified."
+
+        try:
+            return replay_history_song(argument)
+
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    if command == "pause":
+        try:
+            mpc("toggle")
+            return "OK"
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    if command == "restart":
+        try:
+            mpc("seek", "0")
+            return "OK"
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    if command == "previous":
+        try:
+            return previous_song()
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    if command == "stop":
+
+        with state_lock:
+            # Disable automatic playback first.
+            # This prevents the MPD event loop from
+            # immediately starting another song.
+            active = False
+
+            # Stop MPD.
+            try:
+                mpc("stop")
+            except Exception:
+                pass
+
+            # Start a completely fresh playback cycle.
+            write_lines(HISTORY_FILE, [])
+            write_lines(QUEUE_FILE, [])
+            save_state(-1)
+
+        return "⏹ PyroPlayer stopped. 🔄 Cycle reset."
+
+
+    if command == "shutdown":
+        active = False
+        running = False
+
+        try:
+            mpc("stop")
+        except Exception:
+            pass
+
+        if server:
+            threading.Thread(
+                target=server.shutdown,
+                daemon=True
+            ).start()
+
+        return "PyroPlayer daemon stopped."
+
+    return "ERROR: Unknown command."
+
+
+# ============================================================
+# UNIX SOCKET SERVER
+# ============================================================
+
+class RequestHandler(socketserver.StreamRequestHandler):
+
+    def handle(self):
+
+        try:
+            line = self.rfile.readline(1024 * 1024)
+
+            if not line:
+                return
+
+            request = json.loads(
+                line.decode("utf-8")
+            )
+
+            command = request.get("command")
+            argument = request.get("argument")
+
+            response = handle_command(
+                command,
+                argument
+            )
+
+            self.wfile.write(
+                json.dumps(
+                    {"ok": True, "data": response},
+                    ensure_ascii=False
+                ).encode("utf-8")
+                + b"\n"
+            )
+
+        except Exception as e:
+
+            self.wfile.write(
+                json.dumps(
+                    {"ok": False, "error": str(e)}
+                ).encode("utf-8")
+                + b"\n"
+            )
+
+
+class ThreadedUnixServer(
+    socketserver.ThreadingMixIn,
+    socketserver.UnixStreamServer
+):
+
+    daemon_threads = True
+
+
+# ============================================================
+# MPD EVENT LOOP
+# ============================================================
+
+def mpd_event_loop():
+
+    global running
+    global commanded_change
+    global expected_song
+    global last_played_song
+
+    while running:
+
+        try:
+
+            # Wait for an MPD player event.
+            mpc("idle", "player")
+
+            if not running:
+                break
+
+            if not active:
+                continue
+
+            # ------------------------------------------------
+            # Check what MPD is actually doing.
+            # ------------------------------------------------
+
+            actual_song = current_song()
+            state = mpd_state()
+
+            # ------------------------------------------------
+            # Ignore events generated by our own commands.
+            # ------------------------------------------------
+
+            if commanded_change:
+
+                if expected_song and actual_song == expected_song:
+                    # Our requested song is now playing.
+                    commanded_change = False
+
+                continue
+
+            # ------------------------------------------------
+            # Natural song completion.
+            #
+            # Only here do we automatically choose another
+            # song.
+            # ------------------------------------------------
+
+            if state == "stopped":
+
+                try:
+                    play_next()
+
+                except Exception as e:
+                    log(
+                        f"Auto-next error: {e}"
+                    )
+
+        except Exception as e:
+
+            log(
+                f"MPD event error: {e}"
+            )
+
+            time.sleep(1)
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+def log(message):
+
+    try:
+        with open(
+            LOG_FILE,
+            "a",
+            encoding="utf-8"
+        ) as f:
+
+            f.write(
+                time.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                + " "
+                + message
+                + "\n"
+            )
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# DAEMON
+# ============================================================
+
+def run_daemon():
+
+    global server
+    global lock_fd
+    global running
+
+    # --------------------------------------------------------
+    # Single-instance lock
+    # --------------------------------------------------------
+
+    lock_fd = open(LOCK_FILE, "w")
+
+    try:
+        fcntl.flock(
+            lock_fd,
+            fcntl.LOCK_EX | fcntl.LOCK_NB
+        )
+
+    except BlockingIOError:
+        print(
+            "🔥 PyroPlayer is already running."
+        )
+        sys.exit(1)
+
+    lock_fd.write(str(os.getpid()))
+    lock_fd.flush()
+
+    # --------------------------------------------------------
+    # Remove stale socket
+    # --------------------------------------------------------
+
+    if os.path.exists(SOCKET_FILE):
+        os.unlink(SOCKET_FILE)
+
+    # --------------------------------------------------------
+    # Create server
+    # --------------------------------------------------------
+
+    server = ThreadedUnixServer(
+        SOCKET_FILE,
+        RequestHandler
+    )
+
+    os.chmod(SOCKET_FILE, 0o600)
+
+    log(
+        f"PyroPlayer daemon started "
+        f"(PID {os.getpid()})"
+    )
+
+    # --------------------------------------------------------
+    # Start MPD event watcher
+    # --------------------------------------------------------
+
+    watcher = threading.Thread(
+        target=mpd_event_loop,
+        daemon=True
+    )
+
+    watcher.start()
+
+    # --------------------------------------------------------
+    # Serve commands
+    # --------------------------------------------------------
+
+    try:
+
+        server.serve_forever()
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+
+        running = False
+
+        server.server_close()
+
+        if os.path.exists(SOCKET_FILE):
+            os.unlink(SOCKET_FILE)
+
+        log("PyroPlayer daemon stopped.")
+
+
+# ============================================================
+# CLIENT
+# ============================================================
+
+def daemon_running():
+
+    if not os.path.exists(SOCKET_FILE):
+        return False
+
+    try:
+
+        response = send_command("ping")
+
+        return response == "OK"
+
+    except Exception:
+        return False
+
+
+def start_daemon():
+
+    if daemon_running():
+        return False
+
+    log_file = open(
+        LOG_FILE,
+        "a",
+        encoding="utf-8"
+    )
+
+    subprocess.Popen(
+        [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--daemon"
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=log_file,
+        start_new_session=True
+    )
+
+    for _ in range(30):
+
+        if daemon_running():
+            return True
+
+        time.sleep(0.1)
+
+    print(
+        "ERROR: Could not start PyroPlayer daemon."
+    )
+
+    sys.exit(1)
+
+
+def send_command(command, argument=None):
+
+    request = {
+        "command": command,
+        "argument": argument
+    }
+
+    with socket.socket(
+        socket.AF_UNIX,
+        socket.SOCK_STREAM
+    ) as sock:
+
+        sock.settimeout(10)
+
+        sock.connect(SOCKET_FILE)
+
+        sock.sendall(
+            json.dumps(
+                request,
+                ensure_ascii=False
+            ).encode("utf-8")
+            + b"\n"
+        )
+
+        response = sock.makefile("rb").readline()
+
+    if not response:
+        raise RuntimeError(
+            "PyroPlayer daemon closed the connection."
+        )
+
+    data = json.loads(
+        response.decode("utf-8")
+    )
+
+    if not data["ok"]:
+        raise RuntimeError(
+            data.get("error", "Unknown error")
+        )
+
+    return data["data"]
+
+# ============================================================
+# FZF
+# ============================================================
+
+def fzf_song():
+
+    output = send_command(
+        "available"
+    )
+
+    songs = output
+
+    if not songs:
+        return None
+
+    result = subprocess.run(
+        [
+            "fzf",
+            "--height=80%",
+            "--layout=reverse",
+            "--border",
+            "--prompt=🎵 Select song: "
+        ],
+        input=songs,
+        text=True,
+        capture_output=True
+    )
+
+    if result.returncode != 0:
+        return None
+
+    song = result.stdout.strip()
+
+    return song or None
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+def help_text():
+
+    print("""
+🔥 PYROPLAYER
+Non-repeating music player for Termux + MPD
+
+USAGE
+    pyroplayer <command>
+
+PLAYER
+    pyroplayer start
+        Start PyroPlayer.
+
+    pyroplayer c
+        Show current song and status.
+
+    pyroplayer pause
+        Pause / resume playback.
+
+    pyroplayer n
+        Immediately play a random unplayed song.
+
+    pyroplayer p
+        Play the previous song.
+
+    pyroplayer r
+        Restart the current song.
+
+    pyroplayer q
+        Stop PyroPlayer.
+
+SONG SELECTION
+    pyroplayer s
+        Choose an unplayed song with fzf
+        and play it immediately.
+
+    pyroplayer next
+        Choose an unplayed song with fzf
+        and put it at the front of your planned queue.
+
+QUEUE
+    pyroplayer queue
+        Show planned songs.
+
+HISTORY
+    pyroplayer h
+        Show songs played during the current cycle.
+
+    pyroplayer reset
+        Reset the current cycle.
+
+EXAMPLES
+    pyroplayer start
+    pyroplayer c
+    pyroplayer next
+    pyroplayer queue
+    pyroplayer pause
+    pyroplayer h
+""")
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def main():
+
+    if len(sys.argv) >= 2:
+
+        if sys.argv[1] == "--daemon":
+            run_daemon()
+            return
+
+    command = sys.argv[1] if len(sys.argv) > 1 else ""
+
+    # --------------------------------------------------------
+    # Start
+    # --------------------------------------------------------
+
+    if command == "start":
+
+        start_daemon()
+
+        result = send_command("status")
+
+        if result["active"]:
+            print(
+                "🔥 PyroPlayer is already running."
+            )
+            print(
+                f"🎵 {result['song']}"
+            )
+            return
+
+        print()
+        print("🔥 PYROPLAYER")
+        print("────────────────────────────────")
+        print()
+        print("How should the first song be chosen?")
+        print()
+        print("  1) Choose a song")
+        print("  2) Random song")
+        print()
+
+        choice = input(
+            "Choice [1/2]: "
+        ).strip()
+
+        if choice == "1":
+
+            # Get available songs directly.
+            songs = send_command("available")
+
+            if not songs:
+                print(
+                    "No unplayed songs available."
+                )
+                return
+
+            result = subprocess.run(
+                [
+                    "fzf",
+                    "--height=80%",
+                    "--layout=reverse",
+                    "--border",
+                    "--prompt=🎵 Select first song: "
+                ],
+                input=songs,
+                text=True,
+                capture_output=True
+            )
+
+            if result.returncode != 0:
+                return
+
+            song = result.stdout.strip()
+
+            if song:
+                print(
+                    send_command(
+                        "play",
+                        song
+                    )
+                )
+
+        elif choice == "2":
+
+            print(
+                send_command(
+                    "start_random"
+                )
+            )
+
+        else:
+
+            print("Invalid choice.")
+
+        return
+
+    # --------------------------------------------------------
+    # Commands that don't require daemon
+    # --------------------------------------------------------
+
+    if command in ("", "help", "--help", "-h"):
+
+        help_text()
+        return
+
+    # --------------------------------------------------------
+    # Ensure daemon exists
+    # --------------------------------------------------------
+
+    start_daemon()
+
+    # --------------------------------------------------------
+    # Current
+    # --------------------------------------------------------
+
+    if command == "c":
+
+        result = send_command("status")
+
+        print()
+        print(
+            f"🎵 {result['song'] or 'Nothing playing'}"
+        )
+        print(
+            f"State: {result['state']}"
+        )
+        print(
+            f"Played: {result['played']} / "
+            f"{result['total']}"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # History
+    # --------------------------------------------------------
+
+    if command == "h":
+
+        songs = send_command("history")
+
+        if not songs:
+            print("No songs have been played yet.")
+            return
+
+        result = subprocess.run(
+            [
+                "fzf",
+                "--height=80%",
+                "--layout=reverse",
+                "--border",
+                "--prompt=🔥 History: "
+            ],
+            input=songs,
+            text=True,
+            capture_output=True
+        )
+
+        if result.returncode != 0:
+            return
+
+        selected = result.stdout.strip()
+
+        if not selected:
+            return
+
+        # Remove the history number from the selected line.
+        #
+        # Example:
+        # "  7  Holiday.mp3"
+        #
+        # becomes:
+        # "Holiday.mp3"
+
+        parts = selected.split(maxsplit=1)
+
+        if len(parts) != 2:
+            print("ERROR: Invalid history entry.")
+            return
+
+        song = parts[1]
+
+        print(
+            send_command(
+                "history_play",
+                song
+            )
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Queue
+    # --------------------------------------------------------
+
+    if command == "queue":
+
+        print()
+        print("🔥 PYROPLAYER QUEUE")
+        print("────────────────────────────────")
+
+        print(
+            send_command("queue")
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Select and play now
+    # --------------------------------------------------------
+
+    if command == "s":
+
+        songs = send_command("available")
+
+        if not songs:
+            print(
+                "No unplayed songs available."
+            )
+            return
+
+        result = subprocess.run(
+            [
+                "fzf",
+                "--height=80%",
+                "--layout=reverse",
+                "--border",
+                "--prompt=🎵 Play now: "
+            ],
+            input=songs,
+            text=True,
+            capture_output=True
+        )
+
+        if result.returncode != 0:
+            return
+
+        song = result.stdout.strip()
+
+        if song:
+            print(
+                send_command(
+                    "play",
+                    song
+                )
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # Choose next
+    # --------------------------------------------------------
+
+    if command == "next":
+
+        songs = send_command("available")
+
+        if not songs:
+            print(
+                "No unplayed songs available."
+            )
+            return
+
+        result = subprocess.run(
+            [
+                "fzf",
+                "--height=80%",
+                "--layout=reverse",
+                "--border",
+                "--prompt=⏭ Choose next: "
+            ],
+            input=songs,
+            text=True,
+            capture_output=True
+        )
+
+        if result.returncode != 0:
+            return
+
+        song = result.stdout.strip()
+
+        if song:
+            print(
+                send_command(
+                    "queue_add",
+                    song
+                )
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # Random next
+    # --------------------------------------------------------
+
+    if command == "n":
+
+        print(
+            send_command(
+                "next_random"
+            )
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Previous
+    # --------------------------------------------------------
+
+    if command == "p":
+
+        print(
+            send_command(
+                "previous"
+            )
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Pause
+    # --------------------------------------------------------
+
+    if command == "pause":
+
+        send_command("pause")
+        return
+
+    # --------------------------------------------------------
+    # Restart
+    # --------------------------------------------------------
+
+    if command == "r":
+
+        send_command("restart")
+        return
+
+    # --------------------------------------------------------
+    # Stop
+    # --------------------------------------------------------
+
+    if command == "q":
+
+        print(
+            send_command("stop")
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Reset
+    # --------------------------------------------------------
+
+    if command == "reset":
+
+        send_command("reset")
+
+        print(
+            "🔥 Playback cycle reset."
+        )
+
+        return
+
+    print(
+        f"Unknown command: {command}"
+    )
+
+    print(
+        "Run 'pyroplayer' for help."
+    )
+
+
+if __name__ == "__main__":
+    main()
